@@ -63,7 +63,7 @@ def test_first_iteration_returns_same_list():
 def test_no_old_history_returns_unchanged():
     loop = _mk_loop(budget=500)
     msgs = [_system(), _user("current")]
-    result = loop._trim_history_for_budget(msgs, turn_start=1, iteration=2)
+    result = loop._trim_history_for_budget(msgs, turn_start_index=1, iteration=2)
     assert result is msgs
 
 
@@ -72,7 +72,7 @@ def test_no_old_history_returns_unchanged():
 def test_history_under_budget_returns_unchanged():
     loop = _mk_loop(budget=50000)
     msgs = [_system(), _user("old msg"), _assistant("reply"), _user("current")]
-    result = loop._trim_history_for_budget(msgs, turn_start=3, iteration=2)
+    result = loop._trim_history_for_budget(msgs, turn_start_index=3, iteration=2)
     assert result is msgs
 
 
@@ -81,7 +81,7 @@ def test_history_under_budget_returns_unchanged():
 def test_basic_trim_removes_oldest():
     loop = _mk_loop(budget=500)
     old_msgs = []
-    for i in range(20):
+    for i in range(40):
         old_msgs.append(_user(f"old message number {i} with some padding text to inflate tokens"))
         old_msgs.append(_assistant(f"reply to message {i} with extra content for token count"))
     current_user = _user("current task: do something")
