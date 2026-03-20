@@ -57,14 +57,20 @@ _FALLBACK = IntentResult(
 class IntentClassifier:
     """Stateless intent classifier. Caller must resolve model string before calling."""
 
-    async def classify(self, text: str, model: str) -> IntentResult:
+    async def classify(
+        self,
+        text: str,
+        model: str,
+        api_key: str | None = None,
+        api_base: str | None = None,
+    ) -> IntentResult:
         """
         Classify *text* using *model*.
 
         Raises the underlying LiteLLM exception on API failure.
         Falls back to a low-confidence 'chat' intent on JSON parse failure.
         """
-        response = await acompletion(
+        kwargs: dict = dict(
             model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -73,6 +79,11 @@ class IntentClassifier:
             temperature=0.0,
             max_tokens=300,
         )
+        if api_key:
+            kwargs["api_key"] = api_key
+        if api_base:
+            kwargs["api_base"] = api_base
+        response = await acompletion(**kwargs)
         raw = response.choices[0].message.content or ""
         return self._parse(raw)
 

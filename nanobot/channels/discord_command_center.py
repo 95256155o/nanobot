@@ -68,6 +68,8 @@ class CommandCenterRouter:
         content: str,
         guild_id: str | None,
         model: str,
+        api_key: str | None = None,
+        api_base: str | None = None,
     ) -> None:
         """Full classify->post-menu->arm-timeout flow."""
         ch = self._channel
@@ -75,7 +77,7 @@ class CommandCenterRouter:
         await ch._add_reaction(channel_id, message_id, "\U0001f440")
 
         try:
-            result = await ch._classifier.classify(content, model)
+            result = await ch._classifier.classify(content, model, api_key=api_key, api_base=api_base)
         except Exception as e:
             logger.warning("CommandCenter: classification failed: {}", e)
             await ch._remove_reaction(channel_id, message_id, "\U0001f440")
@@ -210,6 +212,24 @@ class DiscordCommandCenterChannel(DiscordChannel):
         except Exception:
             return "anthropic/claude-haiku-4-5-20251001"
 
+    def _resolved_api_key(self) -> str | None:
+        """Resolve API key from nanobot config for the classifier model."""
+        try:
+            from nanobot.config.loader import get_config
+            cfg = get_config()
+            return cfg.agents.defaults.get_api_key()
+        except Exception:
+            return None
+
+    def _resolved_api_base(self) -> str | None:
+        """Resolve API base URL from nanobot config for the classifier model."""
+        try:
+            from nanobot.config.loader import get_config
+            cfg = get_config()
+            return cfg.agents.defaults.get_api_base()
+        except Exception:
+            return None
+
     async def _handle_message_create(self, payload: dict[str, Any]) -> None:
         """Override: only process command_center_channel_id; discard everything else."""
         author = payload.get("author") or {}
@@ -235,6 +255,8 @@ class DiscordCommandCenterChannel(DiscordChannel):
             content=content,
             guild_id=guild_id,
             model=self._resolved_model(),
+            api_key=self._resolved_api_key(),
+            api_base=self._resolved_api_base(),
         )
 
     async def _handle_reaction_add(self, payload: dict[str, Any]) -> None:
