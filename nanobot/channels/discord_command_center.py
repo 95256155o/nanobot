@@ -208,9 +208,9 @@ class DiscordCommandCenterChannel(DiscordChannel):
         api_base: str | None = None
 
         try:
-            from nanobot.config.loader import get_config
+            from nanobot.config.loader import load_config
             from nanobot.providers.registry import find_by_name
-            cfg = get_config()
+            cfg = load_config()
 
             if not model:
                 model = cfg.agents.defaults.model
