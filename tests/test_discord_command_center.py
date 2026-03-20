@@ -149,16 +149,15 @@ async def test_non_cc_message_is_discarded():
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_posts_clarification():
-    """If top intent confidence < threshold, post clarification, no pending state."""
+async def test_trash_confidence_posts_dismissal():
+    """If top intent confidence < 0.3, post dismissal, no pending state."""
     ch = _make_channel()
     low_result = IntentResult(
-        primary=[Intent("chat", "unclear", 0.3)]
+        primary=[Intent("chat", "gibberish", 0.2)]
     )
 
     with patch("nanobot.channels.discord_command_center.IntentClassifier") as MockCLF:
         MockCLF.return_value.classify = AsyncMock(return_value=low_result)
-        # Re-init to pick up mocked classifier
         ch._classifier = MockCLF()
         with patch.object(ch, "_add_reaction", AsyncMock()):
             with patch.object(ch, "_remove_reaction", AsyncMock()):
@@ -172,8 +171,34 @@ async def test_low_confidence_posts_clarification():
 
     mock_send.assert_called_once()
     msg_content = mock_send.call_args[0][0]
-    assert "❓" in msg_content
+    assert "messing around" in msg_content
     assert len(ch._router._pending) == 0
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_still_shows_menu():
+    """Confidence between 0.3 and 0.5 should still show the reaction menu."""
+    ch = _make_channel()
+    low_result = IntentResult(
+        primary=[Intent("chat", "unclear", 0.35)]
+    )
+
+    with patch("nanobot.channels.discord_command_center.IntentClassifier") as MockCLF:
+        MockCLF.return_value.classify = AsyncMock(return_value=low_result)
+        ch._classifier = MockCLF()
+        with patch.object(ch, "_add_reaction", AsyncMock()):
+            with patch.object(ch, "_remove_reaction", AsyncMock()):
+                with patch.object(ch, "_send_cc_message", AsyncMock(return_value="menu1")) as mock_send:
+                    payload = {
+                        "id": "msg1", "channel_id": "cc123", "guild_id": "g1",
+                        "author": {"id": "user1", "bot": False},
+                        "content": "hmm", "attachments": [],
+                    }
+                    await ch._handle_message_create(payload)
+
+    msg_content = mock_send.call_args_list[0][0][0]
+    assert "Detected intent" in msg_content
+    assert len(ch._router._pending) == 1
 
 
 @pytest.mark.asyncio
@@ -233,8 +258,7 @@ async def test_timeout_removes_pending_and_posts_message():
         await ch._router._on_timeout(pending.confirmation_message_id)
 
     assert len(ch._router._pending) == 0
-    mock_send.assert_called_once()
-    assert "⏱️" in mock_send.call_args[0][0]
+    mock_send.assert_not_called()  # silent expiry — no spam
 
 
 # --- Task 5: Routing tests ---

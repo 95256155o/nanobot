@@ -87,10 +87,10 @@ class CommandCenterRouter:
         await ch._remove_reaction(channel_id, message_id, "\U0001f440")
 
         top_confidence = result.primary[0].confidence if result.primary else 0.0
-        if top_confidence < ch.config.low_confidence_threshold:
+        if top_confidence < 0.3:
             await ch._send_cc_message(
-                "\u2753 Not sure what you need. Reply with one of: "
-                "chat, code, research, write, memo, remind"
+                "I'm not here for messing around. "
+                "If you want to chat, head over to the chat channel \U0001f44b"
             )
             return
 
@@ -140,9 +140,8 @@ class CommandCenterRouter:
             pending.pending_reactions.clear()
 
     async def _on_timeout(self, confirmation_message_id: str) -> None:
-        """Called when confirmation window expires."""
+        """Called when confirmation window expires. Silently cleans up."""
         self._pending.pop(confirmation_message_id, None)
-        await self._channel._send_cc_message("\u23f1\ufe0f Timed out. Send again when ready.")
 
     async def handle_reaction(
         self,
