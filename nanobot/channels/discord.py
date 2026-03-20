@@ -32,6 +32,7 @@ class DiscordConfig(Base):
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
+    ignore_channel_ids: list[str] = Field(default_factory=list)
 
 
 class DiscordChannel(BaseChannel):
@@ -302,6 +303,10 @@ class DiscordChannel(BaseChannel):
         guild_id = payload.get("guild_id")
 
         if not sender_id or not channel_id:
+            return
+
+        # Skip channels delegated to another plugin (e.g. command center)
+        if channel_id in self.config.ignore_channel_ids:
             return
 
         if not self.is_allowed(sender_id):
