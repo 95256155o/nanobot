@@ -288,14 +288,19 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        turn_start_index = len(initial_messages) - 1
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
+            send_messages = self._trim_history_for_budget(
+                messages, turn_start_index, iteration,
+            )
+
             response = await self.provider.chat_with_retry(
-                messages=messages,
+                messages=send_messages,
                 tools=tool_defs,
                 model=self.model,
             )
