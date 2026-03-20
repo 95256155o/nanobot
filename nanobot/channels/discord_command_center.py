@@ -201,34 +201,33 @@ class DiscordCommandCenterChannel(DiscordChannel):
         self._classifier = IntentClassifier()
         self._router = CommandCenterRouter(self)
 
-    def _resolved_model(self) -> str:
-        """Return the classifier model, falling back to the agent's default."""
-        if self.config.classifier_model:
-            return self.config.classifier_model
-        try:
-            from nanobot.config.loader import get_config
-            cfg = get_config()
-            return cfg.agents.defaults.model
-        except Exception:
-            return "anthropic/claude-haiku-4-5-20251001"
+    def _resolved_classifier_params(self) -> dict[str, str | None]:
+        """Resolve model, api_key, and api_base for the classifier from nanobot config."""
+        model = self.config.classifier_model
+        api_key: str | None = None
+        api_base: str | None = None
 
-    def _resolved_api_key(self) -> str | None:
-        """Resolve API key from nanobot config for the classifier model."""
         try:
             from nanobot.config.loader import get_config
+            from nanobot.providers.registry import find_by_name
             cfg = get_config()
-            return cfg.agents.defaults.get_api_key()
-        except Exception:
-            return None
 
-    def _resolved_api_base(self) -> str | None:
-        """Resolve API base URL from nanobot config for the classifier model."""
-        try:
-            from nanobot.config.loader import get_config
-            cfg = get_config()
-            return cfg.agents.defaults.get_api_base()
+            if not model:
+                model = cfg.agents.defaults.model
+
+            api_key = cfg.get_api_key(model)
+            api_base = cfg.get_api_base(model)
+
+            # Apply litellm prefix (e.g. openrouter/ for OpenRouter provider)
+            provider_name = cfg.get_provider_name(model)
+            if provider_name:
+                spec = find_by_name(provider_name)
+                if spec and spec.litellm_prefix and not model.startswith(f"{spec.litellm_prefix}/"):
+                    model = f"{spec.litellm_prefix}/{model}"
         except Exception:
-            return None
+            model = model or "anthropic/claude-haiku-4-5-20251001"
+
+        return {"model": model, "api_key": api_key, "api_base": api_base}
 
     async def _handle_message_create(self, payload: dict[str, Any]) -> None:
         """Override: only process command_center_channel_id; discard everything else."""
@@ -248,15 +247,16 @@ class DiscordCommandCenterChannel(DiscordChannel):
         guild_id = payload.get("guild_id")
         message_id = str(payload.get("id", ""))
 
+        params = self._resolved_classifier_params()
         await self._router.handle_message(
             message_id=message_id,
             channel_id=channel_id,
             sender_id=sender_id,
             content=content,
             guild_id=guild_id,
-            model=self._resolved_model(),
-            api_key=self._resolved_api_key(),
-            api_base=self._resolved_api_base(),
+            model=params["model"],
+            api_key=params["api_key"],
+            api_base=params["api_base"],
         )
 
     async def _handle_reaction_add(self, payload: dict[str, Any]) -> None:
