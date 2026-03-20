@@ -1,6 +1,5 @@
 # NanoBot Discord Command Center — Design Spec
 **Date:** 2026-03-19
-**Branch:** `intent-gate`
 **Target:** First PR (nightly)
 
 ---
@@ -19,24 +18,26 @@ Turn one low-context Discord channel (`#command-center`) into a routing layer th
 
 ## 2. Architecture Overview
 
-```
-Discord Gateway (one connection, one bot token)
-        │
-        ▼
-DiscordCommandCenterChannel   [NEW — subclass of DiscordChannel]
-        │
-        ├── message.channel_id == command_center_channel_id?
-        │       └── CommandCenterRouter  [handles full routing flow]
-        │
-        └── all other messages → super()._handle_message_create()
-                                  └── normal NanoBot agent behavior
+Two separate Discord gateway consumers run on the same bot token, each with explicit channel filtering so no message is handled by both:
 
-DiscordChannel (existing)
-        └── ignore_channel_ids: [command_center_channel_id]
-            (prevents duplicate handling of same events)
+```
+Discord Gateway
+        │
+        ├── DiscordChannel (existing plugin)
+        │       ignoreChannelIds: [command_center_channel_id]
+        │       └── handles all channels EXCEPT #command-center
+        │           → normal NanoBot agent behavior
+        │
+        └── DiscordCommandCenterChannel (new plugin, subclass of DiscordChannel)
+                handles ONLY command_center_channel_id; ignores all other channels silently
+                └── CommandCenterRouter [full routing flow]
 ```
 
-**Key constraint:** Only one handler processes each Discord message. The existing `DiscordChannel` config accepts a new optional `ignore_channel_ids` list; `#command-center` is added there. `DiscordCommandCenterChannel` handles that channel exclusively.
+**Two gateway connections, same token.** Discord permits this. Each plugin manages its own WebSocket connection lifecycle independently.
+
+**`DiscordCommandCenterChannel` does NOT call `super()` to forward non-command-center messages.** It simply discards events from any channel other than `command_center_channel_id`. The existing `discord` plugin handles everything else. There is no shared event dispatch between the two plugins.
+
+**`ignore_channel_ids` on the `discord` plugin** is a new optional field added to `DiscordConfig`. It filters out the specified channel IDs before `_handle_message_create` is called, so `#command-center` messages are never seen by the normal agent pipeline.
 
 ---
 
@@ -53,7 +54,7 @@ DiscordChannel (existing)
 | File | Change |
 |---|---|
 | `nanobot/channels/registry.py` | Register `"discord_command_center"` channel type |
-| `nanobot/config/schema.py` | Add `CommandCenterConfig`; add `ignore_channel_ids` to `DiscordConfig` |
+| `nanobot/config/schema.py` | Add `CommandCenterConfig`; add `ignore_channel_ids: list[str]` to `DiscordConfig` |
 
 ---
 
@@ -103,7 +104,7 @@ class IntentResult:
 ```
 
 - Single async method: `classify(text: str, model: str) -> IntentResult`
-- `model` is required — the caller always resolves the model string from config before calling. `IntentClassifier` never reads config directly. Passing an empty string or calling with no model is a caller contract violation.
+- `model` is required — the caller always resolves the model string from config before calling. `IntentClassifier` never reads config directly.
 - Calls LLM with a compact system prompt listing known intent categories
 - Stateless — no session history, no memory. Raw text only.
 - Known intents (first pass): `code_task`, `research`, `write`, `remind`, `memo`, `chat`, `system_cmd`
@@ -134,14 +135,14 @@ class PendingConfirmation:
     pending_reactions: list = field(default_factory=list)  # buffer for early reactions
 ```
 
-**Reaction race handling:** Reactions that arrive while `reactions_posted = False` are appended to `pending_reactions`. When `reactions_posted` is set to `True` (after all three emoji are posted), `pending_reactions` is replayed immediately. This ensures a fast user who reacts before all three emoji are posted is not silently ignored.
+**Reaction race handling:** Reactions that arrive while `reactions_posted = False` are appended to `pending_reactions`. When `reactions_posted` is set to `True` (after all three emoji are posted), `pending_reactions` is replayed immediately.
 
 ### 6.3 `DiscordCommandCenterChannel`
 
-Subclasses `DiscordChannel`. Overrides `_gateway_loop` to also dispatch `MESSAGE_REACTION_ADD` events. All other gateway events fall through to `super()`.
+Subclasses `DiscordChannel`. Overrides `_gateway_loop` to also dispatch `MESSAGE_REACTION_ADD` events. Events from channels other than `command_center_channel_id` are silently discarded — not forwarded to `super()`.
 
 **Message handling:**
-1. Receive message in `command_center_channel_id`
+1. Receive message in `command_center_channel_id`; discard anything else silently
 2. Add 👀 reaction (processing indicator; failure is silent — cosmetic only)
 3. Call `IntentClassifier.classify()` with the resolved model string
 4. Remove 👀 reaction (success or failure; failure is silent — cosmetic only)
@@ -157,21 +158,28 @@ Subclasses `DiscordChannel`. Overrides `_gateway_loop` to also dispatch `MESSAGE
 
 **Routing:**
 1. Try `POST /channels/{command_center_channel_id}/threads` (public thread on original message)
-2. On failure due to permission error (`403`): skip retry, go directly to step 3
-3. On failure due to transient error (`5xx`): retry once, then go to step 3
+2. On failure due to permission error (`403`): skip retry, go directly to step 4
+3. On failure due to transient error (`5xx`): retry once, then go to step 4
 4. Channel fallback: `POST /guilds/{guild_id}/channels` with `parent_id = session_category_id`
 5. On channel creation failure: post `"⚠️ Could not create session channel."`, clean up, stop
 6. Post handoff in new thread/channel:
-   - `"▶ {intent} — {original_content[:80]}"`
-   - If side intents present, append: `"\n⏳ Side actions will attempt: {labels}"` (this is a promise of attempt, not execution)
-7. Publish `InboundMessage(chat_id=thread_id, session_key_override=None)` → session = `discord:<thread_id>`
+   - `"▶ {intent_label} — {original_content[:80]}"`
+   - If side intents present, append: `"\n⏳ Side actions will attempt: {labels}"` (promise of attempt, not execution)
+7. Publish `InboundMessage(chat_id=thread_id, content=original_content, session_key_override=None)`
+   - `content` is the user's original message text verbatim — the agent's first response is a direct reply to the original request
+   - No wrapper or routing prefix is added; the handoff message posted in step 6 provides the routing context visually
 8. Post in `#command-center`: `"✅ Routed to <#{thread_id}>"` (clickable Discord mention)
 9. Execute side intents best-effort (see below)
 
 **Side intents (after routing succeeds, step 9):**
-- Execute via agent bus with `chat_id = thread_id` (the newly created session thread, not `#command-center`)
-- Each failure reported in `#command-center` separately: `"⚠️ Side action [memo] failed."`
-- Never block or roll back routing
+
+Side intents (`memo`, `remind`) are executed via the agent bus. **The `chat_id` used for side intents must NOT be `thread_id`**, because that would write memo/remind turns into the fresh session history, contaminating it for future routing.
+
+Two options are acknowledged; the implementation plan must choose one:
+- **Option A — ephemeral DM chat_id**: route side intents through a synthetic or DM-based `chat_id` that is never surfaced as a routed session.
+- **Option B — direct tool dispatch**: implement `remind` and `memo` as direct async function calls (not agent turns) that write to their target storage without going through the LLM conversation loop at all.
+
+Either way: each failure reported in `#command-center` separately (`"⚠️ Side action [memo] failed."`), never blocking routing.
 
 ---
 
@@ -179,9 +187,10 @@ Subclasses `DiscordChannel`. Overrides `_gateway_loop` to also dispatch `MESSAGE
 
 No `session_key_override` is set. The thread/channel's Discord ID becomes the natural session key `discord:<thread_id>` through normal `BaseChannel._handle_message()` behavior. All future messages in that thread route to the same isolated session automatically.
 
-**Every routed thread/channel starts with a fresh, empty session.** No thread reuse in the first PR — a new thread is always created. Thread reuse is deferred to a follow-up PR where session history implications can be addressed explicitly.
+**Every routed thread/channel starts with a fresh, empty session.** No thread reuse in the first PR — a new thread is always created.
 
-**`#command-center` never accumulates agent conversation history.** It is routing infrastructure only.
+**How `#command-center` is kept free of agent session history:**
+`DiscordCommandCenterChannel` never publishes an `InboundMessage` with `chat_id = command_center_channel_id`. All command-center messages are handled entirely within `CommandCenterRouter` in-process. Because no message with that `chat_id` is ever put on the agent bus, the `SessionManager` never creates or writes a session file keyed `discord:<command_center_channel_id>`. This is structural enforcement, not a runtime guard.
 
 ---
 
@@ -208,11 +217,11 @@ No `session_key_override` is set. The thread/channel's Discord ID becomes the na
 
 | # | Risk | Mitigation |
 |---|---|---|
-| R1 | Duplicate events if both Discord plugins active on same token | `ignore_channel_ids` in base `DiscordConfig` prevents double-handling |
+| R1 | Duplicate events: both Discord plugins on same token | `ignore_channel_ids` in `DiscordConfig` filters `#command-center` from normal plugin; `DiscordCommandCenterChannel` discards non-CC events |
 | R2 | `MANAGE_THREADS` not granted | Graceful fallback to channel creation; 403 skips retry |
 | R3 | `MANAGE_CHANNELS` not granted (fallback) | Error posted in `#command-center`; no silent failure |
 | R4 | User reacts before all 3 emoji posted | Reaction buffer replayed when `reactions_posted = True` |
-| R5 | Side intent rate-limited | Caught, reported separately in `#command-center`, routing continues |
+| R5 | Side intent writes contaminate fresh session | Implementation must choose Option A (ephemeral chat_id) or Option B (direct tool dispatch) — see Section 6.3 |
 
 ---
 
@@ -230,4 +239,4 @@ No `session_key_override` is set. The thread/channel's Discord ID becomes the na
 
 ## 11. Success Criteria
 
-A user types one mixed-intent message in `#command-center`, sees top-3 intents with confidence scores, reacts to confirm, and continues work in a fresh routed thread with isolated session context. Side intents execute after routing without blocking it.
+A user types one mixed-intent message in `#command-center`, sees top-3 intents with confidence scores, reacts to confirm, and continues work in a fresh routed thread with isolated session context. Side intents execute after routing without contaminating the thread session.
