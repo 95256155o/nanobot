@@ -26,15 +26,23 @@ def discover_channel_names() -> list[str]:
 
 
 def load_channel_class(module_name: str) -> type[BaseChannel]:
-    """Import *module_name* and return the first BaseChannel subclass found."""
+    """Import *module_name* and return the BaseChannel subclass defined there."""
     from nanobot.channels.base import BaseChannel as _Base
 
-    mod = importlib.import_module(f"nanobot.channels.{module_name}")
+    fqn = f"nanobot.channels.{module_name}"
+    mod = importlib.import_module(fqn)
+    # Prefer classes actually defined in this module (not re-imported parents)
+    fallback = None
     for attr in dir(mod):
         obj = getattr(mod, attr)
         if isinstance(obj, type) and issubclass(obj, _Base) and obj is not _Base:
-            return obj
-    raise ImportError(f"No BaseChannel subclass in nanobot.channels.{module_name}")
+            if getattr(obj, "__module__", None) == fqn:
+                return obj
+            if fallback is None:
+                fallback = obj
+    if fallback is not None:
+        return fallback
+    raise ImportError(f"No BaseChannel subclass in {fqn}")
 
 
 def discover_plugins() -> dict[str, type[BaseChannel]]:

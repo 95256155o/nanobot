@@ -226,3 +226,18 @@ def test_builtin_channel_init_from_dict():
     ch = TelegramChannel({"enabled": False, "token": "test-tok", "allowFrom": ["*"]}, bus)
     assert ch.config.token == "test-tok"
     assert ch.config.allow_from == ["*"]
+
+
+def test_discord_command_center_is_auto_discovered():
+    """discord_command_center must appear in discover_channel_names()."""
+    from nanobot.channels.registry import discover_channel_names
+    names = discover_channel_names()
+    assert "discord_command_center" in names
+
+
+def test_discord_command_center_channel_class_loads():
+    """load_channel_class must return DiscordCommandCenterChannel."""
+    from nanobot.channels.registry import load_channel_class
+    from nanobot.channels.discord_command_center import DiscordCommandCenterChannel
+    cls = load_channel_class("discord_command_center")
+    assert cls is DiscordCommandCenterChannel

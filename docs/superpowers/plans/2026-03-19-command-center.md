@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Resume checkpoint (2026-03-19):** Paused before Task 1 dispatch. Baseline commit: `b8356da`. Branch: `intent-gate` in `~/nanobot-fork`. All 7 tasks pending. Resume by dispatching Task 1 subagent.
+
 **Goal:** Add a `#command-center` Discord channel that classifies incoming messages, asks for emoji confirmation, then routes work to a fresh isolated thread with its own NanoBot session.
 
 **Architecture:** `DiscordCommandCenterChannel` (subclass of `DiscordChannel`) runs as a second gateway consumer on the same token, handling only `command_center_channel_id`. The existing `discord` plugin gains an `ignore_channel_ids` field to skip that channel. A stateless `IntentClassifier` calls LiteLLM to classify text into structured intents. A `CommandCenterRouter` state machine manages the confirm-then-route flow in memory.
