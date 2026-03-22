@@ -172,44 +172,14 @@ async def test_trash_confidence_posts_dismissal():
     mock_send.assert_called_once()
     msg_content = mock_send.call_args[0][0]
     assert "messing around" in msg_content
-    assert len(ch._router._pending) == 0
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_still_shows_menu():
-    """Confidence between 0.3 and 0.5 should still show the reaction menu."""
-    ch = _make_channel()
-    low_result = IntentResult(
-        primary=[Intent("chat", "unclear", 0.35)]
-    )
-
-    with patch("nanobot.channels.discord_command_center.IntentClassifier") as MockCLF:
-        MockCLF.return_value.classify = AsyncMock(return_value=low_result)
-        ch._classifier = MockCLF()
-        with patch.object(ch, "_add_reaction", AsyncMock()):
-            with patch.object(ch, "_remove_reaction", AsyncMock()):
-                with patch.object(ch, "_send_cc_message", AsyncMock(return_value="menu1")) as mock_send:
-                    payload = {
-                        "id": "msg1", "channel_id": "cc123", "guild_id": "g1",
-                        "author": {"id": "user1", "bot": False},
-                        "content": "hmm", "attachments": [],
-                    }
-                    await ch._handle_message_create(payload)
-
-    msg_content = mock_send.call_args_list[0][0][0]
-    assert "Detected intent" in msg_content
-    assert len(ch._router._pending) == 1
-
-
-@pytest.mark.asyncio
-async def test_high_confidence_creates_pending_confirmation():
-    """Valid classification creates PendingConfirmation and posts intent menu."""
+async def test_confident_intent_routes_directly():
+    """Confidence >= 0.3 should route directly without reaction menu."""
     ch = _make_channel()
     high_result = IntentResult(
-        primary=[
-            Intent("code_task", "fix the bug", 0.88),
-            Intent("research", "look into it", 0.55),
-        ]
+        primary=[Intent("code_task", "fix the bug", 0.88)]
     )
 
     with patch("nanobot.channels.discord_command_center.IntentClassifier") as MockCLF:
@@ -217,8 +187,8 @@ async def test_high_confidence_creates_pending_confirmation():
         ch._classifier = MockCLF()
         with patch.object(ch, "_add_reaction", AsyncMock()):
             with patch.object(ch, "_remove_reaction", AsyncMock()):
-                with patch.object(ch, "_send_cc_message", AsyncMock(return_value="menu_msg_id")):
-                    with patch.object(ch._router, "_post_reaction_numbers", AsyncMock()):
+                with patch.object(ch, "_route", AsyncMock()) as mock_route:
+                    with patch.object(ch, "_send_cc_message", AsyncMock()):
                         payload = {
                             "id": "msg1", "channel_id": "cc123", "guild_id": "g1",
                             "author": {"id": "user1", "bot": False},
@@ -226,12 +196,14 @@ async def test_high_confidence_creates_pending_confirmation():
                         }
                         await ch._handle_message_create(payload)
 
-    assert len(ch._router._pending) == 1
+    mock_route.assert_called_once()
+    args = mock_route.call_args
+    assert args[0][1].label == "code_task"
 
 
 @pytest.mark.asyncio
-async def test_timeout_removes_pending_and_posts_message():
-    """When confirmation times out, pending state is removed and timeout message is posted."""
+async def test_no_pending_state_after_route():
+    """Direct routing should leave no pending state."""
     ch = _make_channel()
     high_result = IntentResult(
         primary=[Intent("code_task", "fix bug", 0.88)]
@@ -242,8 +214,8 @@ async def test_timeout_removes_pending_and_posts_message():
         ch._classifier = MockCLF()
         with patch.object(ch, "_add_reaction", AsyncMock()):
             with patch.object(ch, "_remove_reaction", AsyncMock()):
-                with patch.object(ch, "_send_cc_message", AsyncMock(return_value="menu_id")):
-                    with patch.object(ch._router, "_post_reaction_numbers", AsyncMock()):
+                with patch.object(ch, "_route", AsyncMock()):
+                    with patch.object(ch, "_send_cc_message", AsyncMock()):
                         payload = {
                             "id": "msg1", "channel_id": "cc123", "guild_id": "g1",
                             "author": {"id": "user1", "bot": False},
@@ -251,14 +223,7 @@ async def test_timeout_removes_pending_and_posts_message():
                         }
                         await ch._handle_message_create(payload)
 
-    # Manually trigger the timeout
-    assert len(ch._router._pending) == 1
-    pending = list(ch._router._pending.values())[0]
-    with patch.object(ch, "_send_cc_message", AsyncMock()) as mock_send:
-        await ch._router._on_timeout(pending.confirmation_message_id)
-
-    assert len(ch._router._pending) == 0
-    mock_send.assert_not_called()  # silent expiry — no spam
+    assert not hasattr(ch._router, '_pending') or len(ch._router._pending) == 0
 
 
 # --- Task 5: Routing tests ---
@@ -267,15 +232,12 @@ from nanobot.channels.discord_command_center import PendingConfirmation
 
 
 def _make_pending(ch: DiscordCommandCenterChannel) -> PendingConfirmation:
-    loop = asyncio.get_event_loop()
     return PendingConfirmation(
         original_message_id="orig1",
         original_channel_id="cc123",
         original_sender_id="user1",
         original_content="fix the login bug in auth.py",
         intents=IntentResult(primary=[Intent("code_task", "fix auth", 0.88)]),
-        confirmation_message_id="menu1",
-        timeout_handle=loop.call_later(60, lambda: None),
         guild_id="guild1",
     )
 
@@ -285,7 +247,6 @@ async def test_route_creates_thread_and_publishes_message():
     """Happy path: thread is created and InboundMessage is published."""
     ch = _make_channel()
     pending = _make_pending(ch)
-    pending.timeout_handle.cancel()
 
     thread_response = MagicMock(
         status_code=200,
@@ -314,7 +275,6 @@ async def test_route_falls_back_to_channel_on_403():
     """Thread creation 403 -> falls back to channel creation without retry."""
     ch = _make_channel()
     pending = _make_pending(ch)
-    pending.timeout_handle.cancel()
 
     # Category configured for fallback
     ch.config = CommandCenterConfig.model_validate({
@@ -356,7 +316,6 @@ async def test_route_posts_error_when_both_fail():
     """If thread and channel creation both fail, error is posted in #command-center."""
     ch = _make_channel()
     pending = _make_pending(ch)
-    pending.timeout_handle.cancel()
 
     fail_resp = MagicMock(status_code=500)
     fail_resp.raise_for_status.side_effect = Exception("500")
@@ -383,7 +342,6 @@ async def test_side_intents_do_not_contaminate_thread_session():
     ch = _make_channel()
     pending = _make_pending(ch)
     pending.intents.side = [Intent("memo", "save progress note", 0.92)]
-    pending.timeout_handle.cancel()
 
     thread_response = MagicMock(
         status_code=200, raise_for_status=MagicMock(),
@@ -409,7 +367,6 @@ async def test_side_intent_failure_reports_without_blocking():
     ch = _make_channel()
     pending = _make_pending(ch)
     pending.intents.side = [Intent("memo", "note something", 0.90)]
-    pending.timeout_handle.cancel()
 
     thread_ok = MagicMock(
         status_code=200, raise_for_status=MagicMock(),
@@ -432,3 +389,97 @@ async def test_side_intent_failure_reports_without_blocking():
     assert ch.bus.publish_inbound.called
     # Error was reported in #command-center
     assert any("⚠️" in m for m in warning_messages)
+
+
+# --- TASK 3+4: New tests for direct route + auto-rename ---
+
+
+@pytest.mark.asyncio
+async def test_rename_tracked_after_creation():
+    """Channels created by _route should be tracked for rename."""
+    ch = _make_channel()
+    pending = _make_pending(ch)
+
+    thread_response = MagicMock(
+        status_code=200, raise_for_status=MagicMock(),
+        json=MagicMock(return_value={"id": "thread999"}),
+    )
+    ch._http.post = AsyncMock(return_value=thread_response)
+    ch.bus.publish_inbound = AsyncMock()
+
+    selected = Intent("code_task", "fix auth", 0.88)
+    with patch.object(ch, "_send_cc_message", AsyncMock()):
+        await ch._route(pending, selected)
+
+    assert "thread999" in ch._created_channels
+
+
+@pytest.mark.asyncio
+async def test_rename_triggers_after_3_turns():
+    """After 3 user messages in a tracked channel, rename should trigger."""
+    ch = _make_channel()
+    ch._created_channels = {"thread999": []}
+    ch._renamed_channels = set()
+
+    with patch.object(ch, "_rename_channel", AsyncMock()) as mock_rename:
+        for i in range(3):
+            payload = {
+                "id": f"msg{i}", "channel_id": "thread999", "guild_id": "g1",
+                "author": {"id": "user1", "bot": False},
+                "content": f"message {i}", "attachments": [],
+            }
+            await ch._handle_message_create(payload)
+
+    mock_rename.assert_called_once_with("thread999")
+
+
+@pytest.mark.asyncio
+async def test_rename_does_not_retrigger():
+    """After rename, further messages should not trigger another rename."""
+    ch = _make_channel()
+    ch._created_channels = {"thread999": []}
+    ch._renamed_channels = {"thread999"}
+
+    with patch.object(ch, "_rename_channel", AsyncMock()) as mock_rename:
+        for i in range(5):
+            payload = {
+                "id": f"msg{i}", "channel_id": "thread999", "guild_id": "g1",
+                "author": {"id": "user1", "bot": False},
+                "content": f"message {i}", "attachments": [],
+            }
+            await ch._handle_message_create(payload)
+
+    mock_rename.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rename_channel_calls_llm_and_patches():
+    """_rename_channel should call LLM for title, then PATCH Discord API."""
+    ch = _make_channel()
+    ch._created_channels = {"thread999": ["fix the bug", "sure", "done"]}
+    ch._renamed_channels = set()
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = "修復登入錯誤"
+
+    patch_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+    ch._http.patch = AsyncMock(return_value=patch_resp)
+
+    with patch("nanobot.channels.discord_command_center.acompletion", AsyncMock(return_value=mock_response)):
+        with patch.object(ch, "_resolved_classifier_params", return_value={
+            "model": "test-model", "api_key": "key", "api_base": None
+        }):
+            await ch._rename_channel("thread999")
+
+    # Channel was renamed via PATCH
+    ch._http.patch.assert_called_once()
+    call_kwargs = ch._http.patch.call_args
+    assert "thread999" in call_kwargs[0][0]
+    assert call_kwargs[1]["json"]["name"] == "修復登入錯誤"
+
+    # Marked as renamed
+    assert "thread999" in ch._renamed_channels
+
+    # Buffer cleaned up
+    assert "thread999" not in ch._created_channels

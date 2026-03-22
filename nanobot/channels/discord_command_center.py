@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import Field, field_validator
 from loguru import logger
+from litellm import acompletion
 
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.discord import DiscordChannel, DiscordConfig
@@ -16,7 +17,6 @@ from nanobot.config.schema import Base
 from nanobot.intent.classifier import Intent, IntentClassifier, IntentResult
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
-_REACTION_NUMBERS = ["1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3"]
 
 
 class CommandCenterConfig(Base):
@@ -46,11 +46,7 @@ class PendingConfirmation:
     original_sender_id: str
     original_content: str
     intents: IntentResult
-    confirmation_message_id: str
-    timeout_handle: asyncio.TimerHandle
     guild_id: str | None = None
-    reactions_posted: bool = False
-    pending_reactions: list = field(default_factory=list)
 
 
 class CommandCenterRouter:
@@ -71,7 +67,7 @@ class CommandCenterRouter:
         api_key: str | None = None,
         api_base: str | None = None,
     ) -> None:
-        """Full classify->post-menu->arm-timeout flow."""
+        """Classify intent and route directly — no confirmation menu."""
         ch = self._channel
 
         await ch._add_reaction(channel_id, message_id, "\U0001f440")
@@ -86,30 +82,17 @@ class CommandCenterRouter:
 
         await ch._remove_reaction(channel_id, message_id, "\U0001f440")
 
-        top_confidence = result.primary[0].confidence if result.primary else 0.0
-        if top_confidence < 0.3:
+        top = result.primary[0] if result.primary else None
+        if not top or top.confidence < 0.3:
             await ch._send_cc_message(
                 "I'm not here for messing around. "
                 "If you want to chat, head over to the chat channel \U0001f44b"
             )
             return
 
-        # Build and post the intent menu
-        lines = ["**Detected intent \u2014 react to confirm:**"]
-        for i, intent in enumerate(result.primary[:3]):
-            pct = int(intent.confidence * 100)
-            lines.append(f"{_REACTION_NUMBERS[i]} **{intent.label}** \u2014 {intent.description} (~{pct}%)")
-        if result.side:
-            side_labels = ", ".join(s.label for s in result.side)
-            lines.append(f"\n*Also detected: {side_labels}*")
-
-        menu_msg_id = await ch._send_cc_message("\n".join(lines))
-        if not menu_msg_id:
-            return
-
-        # Arm timeout
-        loop = asyncio.get_event_loop()
-        timeout_s = ch.config.confirmation_timeout_s
+        # Post brief confirmation and route directly
+        pct = int(top.confidence * 100)
+        await ch._send_cc_message(f"\U0001f3af **{top.label}** (~{pct}%) — routing...")
 
         pending = PendingConfirmation(
             original_message_id=message_id,
@@ -117,60 +100,10 @@ class CommandCenterRouter:
             original_sender_id=sender_id,
             original_content=content,
             intents=result,
-            confirmation_message_id=menu_msg_id,
-            timeout_handle=loop.call_later(
-                timeout_s, lambda mid=menu_msg_id: asyncio.ensure_future(self._on_timeout(mid))
-            ),
             guild_id=guild_id,
         )
-        self._pending[menu_msg_id] = pending
+        await ch._route(pending, top)
 
-        await self._post_reaction_numbers(channel_id, menu_msg_id, len(result.primary[:3]))
-
-    async def _post_reaction_numbers(self, channel_id: str, message_id: str, count: int) -> None:
-        """Post 1/2/3 reactions sequentially, then set reactions_posted=True."""
-        pending = self._pending.get(message_id)
-        for i in range(count):
-            await self._channel._add_reaction(channel_id, message_id, _REACTION_NUMBERS[i])
-
-        if pending:
-            pending.reactions_posted = True
-            for emoji in list(pending.pending_reactions):
-                await self.handle_reaction(channel_id, message_id, pending.original_sender_id, emoji)
-            pending.pending_reactions.clear()
-
-    async def _on_timeout(self, confirmation_message_id: str) -> None:
-        """Called when confirmation window expires. Silently cleans up."""
-        self._pending.pop(confirmation_message_id, None)
-
-    async def handle_reaction(
-        self,
-        channel_id: str,
-        message_id: str,
-        user_id: str,
-        emoji: str,
-    ) -> None:
-        """Process an incoming reaction. Ignores wrong user, wrong emoji, not-ready state."""
-        pending = self._pending.get(message_id)
-        if not pending:
-            return
-        if user_id != pending.original_sender_id:
-            return
-        if not pending.reactions_posted:
-            pending.pending_reactions.append(emoji)
-            return
-        if emoji not in _REACTION_NUMBERS:
-            return
-
-        idx = _REACTION_NUMBERS.index(emoji)
-        if idx >= len(pending.intents.primary):
-            return
-
-        # Valid selection — cancel timeout and route
-        pending.timeout_handle.cancel()
-        self._pending.pop(message_id, None)
-        selected = pending.intents.primary[idx]
-        await self._channel._route(pending, selected)
 
 
 class DiscordCommandCenterChannel(DiscordChannel):
@@ -199,6 +132,9 @@ class DiscordCommandCenterChannel(DiscordChannel):
         self.config: CommandCenterConfig = config  # override with richer config
         self._classifier = IntentClassifier()
         self._router = CommandCenterRouter(self)
+        # Track sub-channels for auto-rename: channel_id -> [recent messages]
+        self._created_channels: dict[str, list[str]] = {}
+        self._renamed_channels: set[str] = set()
 
     def _resolved_classifier_params(self) -> dict[str, str | None]:
         """Resolve model, api_key, and api_base for the classifier from nanobot config."""
@@ -229,14 +165,23 @@ class DiscordCommandCenterChannel(DiscordChannel):
         return {"model": model, "api_key": api_key, "api_base": api_base}
 
     async def _handle_message_create(self, payload: dict[str, Any]) -> None:
-        """Override: only process command_center_channel_id; discard everything else."""
+        """Process command_center_channel_id for routing, and sub-channels for rename."""
         author = payload.get("author") or {}
         if author.get("bot"):
             return
 
         channel_id = str(payload.get("channel_id", ""))
+
+        # Track messages in sub-channels for auto-rename
+        if channel_id in self._created_channels and channel_id not in self._renamed_channels:
+            content = payload.get("content") or ""
+            self._created_channels[channel_id].append(content)
+            if len(self._created_channels[channel_id]) >= 3:
+                await self._rename_channel(channel_id)
+            return  # Don't re-route messages in sub-channels
+
         if channel_id != self.config.command_center_channel_id:
-            return  # not our channel — discard silently
+            return
 
         sender_id = str(author.get("id", ""))
         if not self.is_allowed(sender_id):
@@ -258,24 +203,6 @@ class DiscordCommandCenterChannel(DiscordChannel):
             api_base=params["api_base"],
         )
 
-    async def _handle_reaction_add(self, payload: dict[str, Any]) -> None:
-        """Handle MESSAGE_REACTION_ADD events."""
-        channel_id = str(payload.get("channel_id", ""))
-        if channel_id != self.config.command_center_channel_id:
-            return
-
-        user_id = str(
-            (payload.get("member") or {}).get("user", {}).get("id", "")
-            or payload.get("user_id", "")
-        )
-        if user_id == self._bot_user_id:
-            return  # ignore own reactions
-
-        message_id = str(payload.get("message_id", ""))
-        emoji_data = payload.get("emoji") or {}
-        emoji_name = emoji_data.get("name", "")
-
-        await self._router.handle_reaction(channel_id, message_id, user_id, emoji_name)
 
     async def _send_cc_message(self, content: str) -> str | None:
         """Post a message to #command-center. Returns message_id on success, None on failure."""
@@ -298,6 +225,9 @@ class DiscordCommandCenterChannel(DiscordChannel):
         if thread_id is None:
             await self._send_cc_message("\u26a0\ufe0f Could not create session channel.")
             return
+
+        # Track this channel for auto-rename
+        self._created_channels[thread_id] = []
 
         # Post handoff message in the new thread
         handoff = f"\u25b6 {selected.label} \u2014 {pending.original_content[:80]}"
@@ -437,8 +367,58 @@ class DiscordCommandCenterChannel(DiscordChannel):
                 logger.warning("CC: side intent [{}] failed: {}", intent.label, e)
                 await self._send_cc_message(f"\u26a0\ufe0f Side action [{intent.label}] failed.")
 
+    async def _rename_channel(self, channel_id: str) -> None:
+        """Generate a short Chinese title via LLM and rename the Discord channel."""
+        self._renamed_channels.add(channel_id)
+
+        messages = self._created_channels.get(channel_id, [])
+        context = "\n".join(messages[:6])
+
+        params = self._resolved_classifier_params()
+        try:
+            kwargs: dict = dict(
+                model=params["model"],
+                messages=[
+                    {"role": "system", "content": (
+                        "根據以下對話內容，生成一個簡短的中文標題（4-8個字），"
+                        "用來描述這段對話的主題。只回覆標題本身，不要加標點符號或解釋。"
+                    )},
+                    {"role": "user", "content": context},
+                ],
+                temperature=0.3,
+                max_tokens=30,
+            )
+            if params.get("api_key"):
+                kwargs["api_key"] = params["api_key"]
+            if params.get("api_base"):
+                kwargs["api_base"] = params["api_base"]
+
+            response = await acompletion(**kwargs)
+            title = (response.choices[0].message.content or "").strip()
+
+            if not title or len(title) > 30:
+                logger.warning("CC: generated title too long or empty: {}", title)
+                return
+
+            safe_title = title.replace(" ", "-")[:100]
+
+            if not self._http:
+                return
+
+            url = f"{DISCORD_API_BASE}/channels/{channel_id}"
+            headers = {"Authorization": f"Bot {self.config.token}"}
+            resp = await self._http.patch(url, headers=headers, json={"name": safe_title})
+            resp.raise_for_status()
+            logger.info("CC: renamed channel {} to '{}'", channel_id, safe_title)
+
+            # Clean up message buffer to prevent memory leak
+            self._created_channels.pop(channel_id, None)
+
+        except Exception as e:
+            logger.warning("CC: failed to rename channel {}: {}", channel_id, e)
+
     async def _gateway_loop(self) -> None:
-        """Extended gateway loop that also dispatches MESSAGE_REACTION_ADD."""
+        """Gateway loop dispatching MESSAGE_CREATE for command center and sub-channels."""
         if not self._ws:
             return
 
@@ -467,8 +447,6 @@ class DiscordCommandCenterChannel(DiscordChannel):
                 logger.info("Discord CC gateway READY as {}", self._bot_user_id)
             elif op == 0 and event_type == "MESSAGE_CREATE":
                 await self._handle_message_create(payload)
-            elif op == 0 and event_type == "MESSAGE_REACTION_ADD":
-                await self._handle_reaction_add(payload)
             elif op == 7:
                 logger.info("Discord CC gateway: reconnect requested")
                 break
