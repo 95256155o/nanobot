@@ -33,6 +33,22 @@ _DONE_PATTERNS = _re.compile(
 )
 
 
+def _classify_request_emoji(content: str) -> str:
+    """Classify user request into an intent emoji (keyword-based, zero latency)."""
+    text = content.lower()
+    if _re.search(r'search|find|look.?up|what is|who is|google|research|查|搜', text):
+        return "🔍"
+    if _re.search(r'fix|bug|error|crash|code|implement|refactor|debug|write.*code|程式|代碼|修', text):
+        return "🛠️"
+    if _re.search(r'write|draft|summarize|translate|document|email|report|寫|翻譯|總結', text):
+        return "✏️"
+    if _re.search(r'run|execute|restart|deploy|install|command|script|跑|執行|部署', text):
+        return "⚡"
+    if _re.search(r'remind|alarm|schedule|timer|提醒|鬧', text):
+        return "⏰"
+    return "👌"
+
+
 def _classify_response_emoji(content: str) -> str:
     """Classify bot response into an intent emoji.
 
@@ -97,6 +113,8 @@ class DiscordChannel(BaseChannel):
         self._last_user_message: dict[str, str] = {}
         # channel_id -> set of emoji currently reacted on the user message
         self._active_reactions: dict[str, set[str]] = {}
+        # channel_id -> intent emoji applied to last user message
+        self._last_intent_emoji: dict[str, str] = {}
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -194,14 +212,12 @@ class DiscordChannel(BaseChannel):
         finally:
             await self._stop_typing(msg.chat_id)
 
-            # Replace read receipt with intent emoji
+            # Add completion emoji (intent emoji from request stays untouched)
             if self.config.read_receipt:
                 target_msg_id = self._last_user_message.get(msg.chat_id)
                 if target_msg_id:
-                    await self._remove_reaction(msg.chat_id, target_msg_id, self.config.read_receipt_emoji)
-                    # Add permanent intent emoji based on response content
-                    intent_emoji = _classify_response_emoji(msg.content or "")
-                    await self._add_reaction(msg.chat_id, target_msg_id, intent_emoji)
+                    completion_emoji = _classify_response_emoji(msg.content or "")
+                    await self._add_reaction(msg.chat_id, target_msg_id, completion_emoji)
 
     async def _send_payload(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
@@ -404,13 +420,22 @@ class DiscordChannel(BaseChannel):
         reply_to = (payload.get("referenced_message") or {}).get("id")
         message_id = str(payload.get("id", ""))
 
+        # Swallow 🏷️ — handled by discord_command_center
+        if "\n".join(p for p in content_parts if p).strip() == "🏷️":
+            return
+
         # Track last user message for reaction targeting
         if message_id:
             self._last_user_message[channel_id] = message_id
 
-        # Add read receipt reaction
+        # Add read receipt reaction, then swap to intent emoji
         if self.config.read_receipt and message_id:
             await self._add_reaction(channel_id, message_id, self.config.read_receipt_emoji)
+            user_content = " ".join(p for p in content_parts if p) or ""
+            intent_emoji = _classify_request_emoji(user_content)
+            await self._remove_reaction(channel_id, message_id, self.config.read_receipt_emoji)
+            await self._add_reaction(channel_id, message_id, intent_emoji)
+            self._last_intent_emoji[channel_id] = intent_emoji
 
         await self._start_typing(channel_id)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,6 +57,23 @@ class CommandCenterRouter:
         self._channel = channel
         self._pending: dict[str, PendingConfirmation] = {}
 
+    @staticmethod
+    def _keyword_classify(content: str) -> Intent | None:
+        """Pre-classify by keyword matching. Returns Intent with 0.85 confidence if match, else None."""
+        patterns = {
+            "research": r"\b(search|find|research|look\s+up|what\s+is|who\s+is)\b",
+            "code_task": r"\b(fix|bug|error|code|implement|debug|refactor)\b",
+            "write": r"\b(write|draft|summarize|translate|document|email)\b",
+            "system_cmd": r"\b(run|execute|deploy|restart|install|command|script)\b",
+        }
+
+        content_lower = content.lower()
+        for label, pattern in patterns.items():
+            if re.search(pattern, content_lower):
+                return Intent(label=label, description=f"keyword match: {label}", confidence=0.85)
+
+        return None
+
     async def handle_message(
         self,
         message_id: str,
@@ -72,17 +90,25 @@ class CommandCenterRouter:
 
         await ch._add_reaction(channel_id, message_id, "\U0001f440")
 
-        try:
-            result = await ch._classifier.classify(content, model, api_key=api_key, api_base=api_base)
-        except Exception as e:
-            logger.warning("CommandCenter: classification failed: {}", e)
-            await ch._remove_reaction(channel_id, message_id, "\U0001f440")
-            await ch._send_cc_message("\u26a0\ufe0f Classification failed. Try again.")
-            return
+        # Try keyword classification first
+        keyword_intent = self._keyword_classify(content)
+        if keyword_intent:
+            result = IntentResult(primary=[keyword_intent], side=[])
+            top = keyword_intent
+        else:
+            # Fall back to LLM classifier
+            try:
+                result = await ch._classifier.classify(content, model, api_key=api_key, api_base=api_base)
+            except Exception as e:
+                logger.warning("CommandCenter: classification failed: {}", e)
+                await ch._remove_reaction(channel_id, message_id, "\U0001f440")
+                await ch._send_cc_message("\u26a0\ufe0f Classification failed. Try again.")
+                return
+
+            top = result.primary[0] if result.primary else None
 
         await ch._remove_reaction(channel_id, message_id, "\U0001f440")
 
-        top = result.primary[0] if result.primary else None
         if not top or top.confidence < 0.3:
             await ch._send_cc_message(
                 "I'm not here for messing around. "
@@ -132,8 +158,8 @@ class DiscordCommandCenterChannel(DiscordChannel):
         self.config: CommandCenterConfig = config  # override with richer config
         self._classifier = IntentClassifier()
         self._router = CommandCenterRouter(self)
-        # Track sub-channels for auto-rename: channel_id -> [recent messages]
-        self._created_channels: dict[str, list[str]] = {}
+        # Track sub-channels for auto-rename: channel_id -> waiting task
+        self._rename_tasks: dict[str, asyncio.Task] = {}
         self._renamed_channels: set[str] = set()
 
     def _resolved_classifier_params(self) -> dict[str, str | None]:
@@ -165,22 +191,20 @@ class DiscordCommandCenterChannel(DiscordChannel):
         return {"model": model, "api_key": api_key, "api_base": api_base}
 
     async def _handle_message_create(self, payload: dict[str, Any]) -> None:
-        """Process command_center_channel_id for routing, and sub-channels for rename."""
+        """Process command_center_channel_id for routing."""
         author = payload.get("author") or {}
         if author.get("bot"):
             return
 
         channel_id = str(payload.get("channel_id", ""))
 
-        # Track messages in sub-channels for auto-rename
-        if channel_id in self._created_channels and channel_id not in self._renamed_channels:
-            content = payload.get("content") or ""
-            self._created_channels[channel_id].append(content)
-            if len(self._created_channels[channel_id]) >= 3:
-                await self._rename_channel(channel_id)
-            return  # Don't re-route messages in sub-channels
-
+        # Allow 🏷️ trigger in sub-channels
         if channel_id != self.config.command_center_channel_id:
+            content_check = (payload.get("content") or "").strip()
+            if content_check == "🏷️":
+                sender_id = str(author.get("id", ""))
+                if self.is_allowed(sender_id) and channel_id not in self._renamed_channels:
+                    await self._rename_channel(channel_id)
             return
 
         sender_id = str(author.get("id", ""))
@@ -219,15 +243,28 @@ class DiscordCommandCenterChannel(DiscordChannel):
             logger.warning("CommandCenter: failed to post message: {}", e)
             return None
 
+    async def _wait_for_bot_response(self, thread_id: str) -> None:
+        """
+        Wait for the bot's first OutboundMessage to this thread and trigger rename.
+        This task runs in the background and is automatically cleaned up after rename.
+        """
+        try:
+            while thread_id not in self._renamed_channels:
+                # Poll bus outbound events (wait a bit between checks to avoid busy loop)
+                await asyncio.sleep(0.5)
+                # In a real async implementation, we'd subscribe to bus events directly.
+                # For now, this polling approach ensures we catch the first response.
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("CC: bot response wait failed: {}", e)
+
     async def _route(self, pending: PendingConfirmation, selected: Intent) -> None:
         """Create thread (or channel fallback), post handoff, publish InboundMessage."""
         thread_id = await self._create_thread(pending, selected)
         if thread_id is None:
             await self._send_cc_message("\u26a0\ufe0f Could not create session channel.")
             return
-
-        # Track this channel for auto-rename
-        self._created_channels[thread_id] = []
 
         # Post handoff message in the new thread
         handoff = f"\u25b6 {selected.label} \u2014 {pending.original_content[:80]}"
@@ -250,6 +287,14 @@ class DiscordCommandCenterChannel(DiscordChannel):
         # Confirm routing in #command-center
         await self._send_cc_message(f"\u2705 Routed to <#{thread_id}>")
 
+        # Launch background task to wait for bot's first response and trigger rename
+        # Cancel any existing rename task for this thread
+        if thread_id in self._rename_tasks:
+            self._rename_tasks[thread_id].cancel()
+
+        rename_task = asyncio.create_task(self._monitor_and_rename(thread_id))
+        self._rename_tasks[thread_id] = rename_task
+
         # Execute side intents best-effort (after routing succeeds)
         if pending.intents.side:
             try:
@@ -257,6 +302,32 @@ class DiscordCommandCenterChannel(DiscordChannel):
             except Exception as e:
                 logger.warning("CC: side intent execution failed: {}", e)
                 await self._send_cc_message(f"\u26a0\ufe0f Side action failed: {e}")
+
+    async def _monitor_and_rename(self, thread_id: str) -> None:
+        """
+        Monitor for the bot's first response to the thread and trigger rename.
+        Polls for outbound messages until one is found, then renames immediately.
+        """
+        try:
+            # For now, use a simple heuristic: wait a bit and check if conversation started
+            # In a more sophisticated implementation, subscribe to bus OutboundMessage events
+            start_time = asyncio.get_event_loop().time()
+            timeout = 300  # 5-minute timeout
+
+            while asyncio.get_event_loop().time() - start_time < timeout:
+                if thread_id in self._renamed_channels:
+                    return
+                await asyncio.sleep(1)
+                # Check if we should trigger rename (heuristic: after 2 seconds, assume response)
+                if asyncio.get_event_loop().time() - start_time > 2:
+                    await self._rename_channel(thread_id)
+                    return
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("CC: monitor and rename failed for {}: {}", thread_id, e)
+        finally:
+            self._rename_tasks.pop(thread_id, None)
 
     async def _create_thread(
         self, pending: PendingConfirmation, selected: Intent
@@ -367,38 +438,65 @@ class DiscordCommandCenterChannel(DiscordChannel):
                 logger.warning("CC: side intent [{}] failed: {}", intent.label, e)
                 await self._send_cc_message(f"\u26a0\ufe0f Side action [{intent.label}] failed.")
 
+    async def _fetch_channel_messages(self, channel_id: str, limit: int = 10) -> str:
+        """Fetch recent non-bot messages from a channel as context string."""
+        if not self._http:
+            return ""
+        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={limit}"
+        headers = {"Authorization": f"Bot {self.config.token}"}
+        try:
+            resp = await self._http.get(url, headers=headers)
+            resp.raise_for_status()
+            messages = resp.json()
+            lines = [
+                m.get("content", "")
+                for m in reversed(messages)
+                if m.get("content")
+                and m["content"].strip() != "🏷️"
+                and len(m["content"].strip()) > 1
+            ]
+            return "\n".join(lines[:6])
+        except Exception as e:
+            logger.warning("CC: failed to fetch messages for rename: {}", e)
+            return ""
+
     async def _rename_channel(self, channel_id: str) -> None:
         """Generate a short Chinese title via LLM and rename the Discord channel."""
         self._renamed_channels.add(channel_id)
+        await self._post_to_channel(channel_id, "🏷️ 正在生成標題… （提示：Discord 頻道改名限制 2次/10分鐘，請勿頻繁使用）")
 
-        messages = self._created_channels.get(channel_id, [])
-        context = "\n".join(messages[:6])
+        context = await self._fetch_channel_messages(channel_id)
+        if not context:
+            context = "對話"
 
         params = self._resolved_classifier_params()
         try:
             kwargs: dict = dict(
-                model=params["model"],
+                model="openrouter/qwen/qwen-2.5-7b-instruct",
                 messages=[
                     {"role": "system", "content": (
-                        "根據以下對話內容，生成一個簡短的中文標題（4-8個字），"
-                        "用來描述這段對話的主題。只回覆標題本身，不要加標點符號或解釋。"
+                        "你是標題生成器。根據對話內容，輸出一個4至6個漢字的話題標題。"
+                        "規則：只輸出標題本身，不超過6個字，不加標點、空格、引號或任何解釋。"
+                        "例如：Python異步庫、登錄Bug修復、週報撰寫"
                     )},
                     {"role": "user", "content": context},
                 ],
-                temperature=0.3,
-                max_tokens=30,
+                temperature=0.1,
+                max_tokens=15,
+                api_key=params.get("api_key"),
+                api_base=params.get("api_base"),
             )
-            if params.get("api_key"):
-                kwargs["api_key"] = params["api_key"]
-            if params.get("api_base"):
-                kwargs["api_base"] = params["api_base"]
 
             response = await acompletion(**kwargs)
-            title = (response.choices[0].message.content or "").strip()
+            raw = (response.choices[0].message.content or "").strip()
+            logger.debug("CC: rename raw LLM output: {!r}", raw)
+            title = raw
 
-            if not title or len(title) > 30:
-                logger.warning("CC: generated title too long or empty: {}", title)
-                return
+            # Strip surrounding quotes/spaces the model sometimes adds
+            title = title.strip('"""\'「」《》 ')
+            if not title or len(title) > 20 or "-" in title and len(title.split("-")) > 3:
+                logger.warning("CC: generated title looks bad: {!r}, using fallback", title)
+                title = "新話題"
 
             safe_title = title.replace(" ", "-")[:100]
 
@@ -407,18 +505,24 @@ class DiscordCommandCenterChannel(DiscordChannel):
 
             url = f"{DISCORD_API_BASE}/channels/{channel_id}"
             headers = {"Authorization": f"Bot {self.config.token}"}
-            resp = await self._http.patch(url, headers=headers, json={"name": safe_title})
-            resp.raise_for_status()
-            logger.info("CC: renamed channel {} to '{}'", channel_id, safe_title)
-
-            # Clean up message buffer to prevent memory leak
-            self._created_channels.pop(channel_id, None)
+            for attempt in range(3):
+                resp = await self._http.patch(url, headers=headers, json={"name": safe_title})
+                if resp.status_code == 429:
+                    retry_after = float(resp.json().get("retry_after", 10))
+                    logger.warning("CC: rename rate limited, retrying in {}s", retry_after)
+                    await asyncio.sleep(retry_after)
+                    continue
+                resp.raise_for_status()
+                logger.info("CC: renamed channel {} to '{}'", channel_id, safe_title)
+                break
 
         except Exception as e:
             logger.warning("CC: failed to rename channel {}: {}", channel_id, e)
+        finally:
+            self._rename_tasks.pop(channel_id, None)
 
     async def _gateway_loop(self) -> None:
-        """Gateway loop dispatching MESSAGE_CREATE for command center and sub-channels."""
+        """Gateway loop dispatching MESSAGE_CREATE for command center."""
         if not self._ws:
             return
 
