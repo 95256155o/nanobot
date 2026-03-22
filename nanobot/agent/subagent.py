@@ -13,7 +13,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
@@ -89,6 +89,9 @@ class SubagentManager:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
+        # Add subagent working reaction
+        await self._publish_reaction(origin, "_reaction_add")
+
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
@@ -158,12 +161,31 @@ class SubagentManager:
                 final_result = "Task completed but no final response was generated."
 
             logger.info("Subagent [{}] completed successfully", task_id)
+            await self._publish_reaction(origin, "_reaction_remove")
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
+            await self._publish_reaction(origin, "_reaction_remove")
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
+
+    async def _publish_reaction(self, origin: dict[str, str], action: str) -> None:
+        """Publish a reaction event to the channel via the bus.
+
+        Args:
+            origin: {"channel": ..., "chat_id": ...}
+            action: "_reaction_add" or "_reaction_remove"
+        """
+        channel = origin["channel"]
+        if channel in ("cli", "system"):
+            return
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=channel,
+            chat_id=origin["chat_id"],
+            content="",
+            metadata={action: "🔧"},
+        ))
 
     async def _announce_result(
         self,

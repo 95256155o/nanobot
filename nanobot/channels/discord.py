@@ -2,9 +2,9 @@
 
 import asyncio
 import json
+import urllib.parse
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote
 
 import httpx
 from pydantic import Field
@@ -32,6 +32,9 @@ class DiscordConfig(Base):
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
+    read_receipt: bool = True
+    read_receipt_emoji: str = "👀"
+    subagent_emoji: str = "🔧"
     ignore_channel_ids: list[str] = Field(default_factory=list)
 
 
@@ -56,7 +59,10 @@ class DiscordChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._http: httpx.AsyncClient | None = None
         self._bot_user_id: str | None = None
-        self._pending_reactions: dict[str, str] = {}  # channel_id -> message_id
+        # channel_id -> message_id of the last user message (for reactions)
+        self._last_user_message: dict[str, str] = {}
+        # channel_id -> set of emoji currently reacted on the user message
+        self._active_reactions: dict[str, set[str]] = {}
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -103,6 +109,20 @@ class DiscordChannel(BaseChannel):
             logger.warning("Discord HTTP client not initialized")
             return
 
+        # Handle reaction-only messages (from subagent events)
+        reaction_add = msg.metadata.get("_reaction_add")
+        reaction_remove = msg.metadata.get("_reaction_remove")
+        if reaction_add or reaction_remove:
+            target_msg_id = self._last_user_message.get(msg.chat_id)
+            if target_msg_id:
+                # Use configured emoji, falling back to the value in metadata
+                emoji = self.config.subagent_emoji or reaction_add or reaction_remove
+                if reaction_add:
+                    await self._add_reaction(msg.chat_id, target_msg_id, emoji)
+                if reaction_remove:
+                    await self._remove_reaction(msg.chat_id, target_msg_id, emoji)
+            return
+
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
         headers = {"Authorization": f"Bot {self.config.token}"}
 
@@ -139,9 +159,12 @@ class DiscordChannel(BaseChannel):
                     break  # Abort remaining chunks on failure
         finally:
             await self._stop_typing(msg.chat_id)
-            message_id = self._pending_reactions.pop(msg.chat_id, None)
-            if message_id:
-                await self._remove_reaction(msg.chat_id, message_id, "👀")
+
+            # Remove read receipt reaction after reply is sent
+            if self.config.read_receipt:
+                target_msg_id = self._last_user_message.get(msg.chat_id)
+                if target_msg_id:
+                    await self._remove_reaction(msg.chat_id, target_msg_id, self.config.read_receipt_emoji)
 
     async def _send_payload(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
@@ -305,7 +328,6 @@ class DiscordChannel(BaseChannel):
         if not sender_id or not channel_id:
             return
 
-        # Skip channels delegated to another plugin (e.g. command center)
         if channel_id in self.config.ignore_channel_ids:
             return
 
@@ -343,13 +365,17 @@ class DiscordChannel(BaseChannel):
                 content_parts.append(f"[attachment: {filename} - download failed]")
 
         reply_to = (payload.get("referenced_message") or {}).get("id")
+        message_id = str(payload.get("id", ""))
+
+        # Track last user message for reaction targeting
+        if message_id:
+            self._last_user_message[channel_id] = message_id
+
+        # Add read receipt reaction
+        if self.config.read_receipt and message_id:
+            await self._add_reaction(channel_id, message_id, self.config.read_receipt_emoji)
 
         await self._start_typing(channel_id)
-
-        message_id = str(payload.get("id", ""))
-        if message_id:
-            await self._add_reaction(channel_id, message_id, "👀")
-            self._pending_reactions[channel_id] = message_id
 
         await self._handle_message(
             sender_id=sender_id,
@@ -384,29 +410,46 @@ class DiscordChannel(BaseChannel):
 
         return True
 
-    async def _add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
-        """Add a reaction to a message."""
+    async def _add_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """Add a reaction emoji to a message. Returns True on success."""
         if not self._http:
-            return
-        emoji_encoded = quote(emoji, safe="")
-        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me"
+            return False
+        encoded = urllib.parse.quote(emoji)
+        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me"
         headers = {"Authorization": f"Bot {self.config.token}"}
         try:
-            await self._http.put(url, headers=headers)
+            resp = await self._http.put(url, headers=headers)
+            if resp.status_code == 429:
+                retry = float(resp.json().get("retry_after", 1.0))
+                await asyncio.sleep(retry)
+                resp = await self._http.put(url, headers=headers)
+            resp.raise_for_status()
+            self._active_reactions.setdefault(channel_id, set()).add(emoji)
+            return True
         except Exception as e:
-            logger.debug("Failed to add reaction: {}", e)
+            logger.debug("Discord add_reaction failed for {}: {}", emoji, e)
+            return False
 
-    async def _remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
-        """Remove bot's own reaction from a message."""
+    async def _remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """Remove a reaction emoji from a message. Returns True on success."""
         if not self._http:
-            return
-        emoji_encoded = quote(emoji, safe="")
-        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me"
+            return False
+        encoded = urllib.parse.quote(emoji)
+        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me"
         headers = {"Authorization": f"Bot {self.config.token}"}
         try:
-            await self._http.delete(url, headers=headers)
+            resp = await self._http.delete(url, headers=headers)
+            if resp.status_code == 429:
+                retry = float(resp.json().get("retry_after", 1.0))
+                await asyncio.sleep(retry)
+                resp = await self._http.delete(url, headers=headers)
+            resp.raise_for_status()
+            if channel_id in self._active_reactions:
+                self._active_reactions[channel_id].discard(emoji)
+            return True
         except Exception as e:
-            logger.debug("Failed to remove reaction: {}", e)
+            logger.debug("Discord remove_reaction failed for {}: {}", emoji, e)
+            return False
 
     async def _start_typing(self, channel_id: str) -> None:
         """Start periodic typing indicator for a channel."""
