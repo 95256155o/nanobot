@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re as _re
 import urllib.parse
 from pathlib import Path
 from typing import Any, Literal
@@ -21,6 +22,39 @@ from nanobot.utils.helpers import split_message
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
+
+_DONE_PATTERNS = _re.compile(
+    r"""(?x)
+    \b(?:done|completed|finished|all\s+set)\b
+    | 已完成 | 搞定 | 完成了
+    | ^\s*✅
+    """,
+    _re.IGNORECASE,
+)
+
+
+def _classify_response_emoji(content: str) -> str:
+    """Classify bot response into an intent emoji.
+
+    Returns:
+        "✅" — task done / completed
+        "❓" — asking follow-up question
+        "👌" — default (acknowledged / doing something)
+    """
+    if not content:
+        return "👌"
+
+    stripped = content.rstrip()
+
+    # Check if the response ENDS with a question (not just contains one)
+    if stripped.endswith("?") or stripped.endswith("？"):
+        return "❓"
+
+    # Check for completion markers
+    if _DONE_PATTERNS.search(content):
+        return "✅"
+
+    return "👌"
 
 
 class DiscordConfig(Base):
@@ -160,11 +194,14 @@ class DiscordChannel(BaseChannel):
         finally:
             await self._stop_typing(msg.chat_id)
 
-            # Remove read receipt reaction after reply is sent
+            # Replace read receipt with intent emoji
             if self.config.read_receipt:
                 target_msg_id = self._last_user_message.get(msg.chat_id)
                 if target_msg_id:
                     await self._remove_reaction(msg.chat_id, target_msg_id, self.config.read_receipt_emoji)
+                    # Add permanent intent emoji based on response content
+                    intent_emoji = _classify_response_emoji(msg.content or "")
+                    await self._add_reaction(msg.chat_id, target_msg_id, intent_emoji)
 
     async def _send_payload(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
